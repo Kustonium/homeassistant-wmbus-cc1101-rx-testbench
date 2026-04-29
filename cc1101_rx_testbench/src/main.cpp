@@ -55,7 +55,7 @@ struct Config {
   int filter_input_len_max{0};
   std::string filter_input_lengths{};
   std::string filter_meter_ids{};
-  bool prefilter_meter_ids{true};
+  bool prefilter_meter_ids{false};
   bool log_ignored{false};
   int stats_every_n{50};
   int stats_interval_s{60};
@@ -313,6 +313,13 @@ bool meter_allowed(const std::string &meter_id) {
   return false;
 }
 
+bool meter_filter_enabled() {
+  // Since 0.1.7 this switch is the master enable for meter filtering.
+  // With prefilter_meter_ids=false a stale filter_meter_ids value no longer
+  // silently suppresses output after decoding.
+  return cfg.prefilter_meter_ids && !cfg.filter_meter_ids.empty();
+}
+
 struct PrefilterResult {
   bool attempted{false};
   bool frame_ok{false};
@@ -548,7 +555,7 @@ void process_payload(const std::string &topic, const std::string &payload, const
   }
 
   PrefilterResult prefilter;
-  if (cfg.prefilter_meter_ids && !cfg.filter_meter_ids.empty()) {
+  if (meter_filter_enabled()) {
     prefilter = decode_meter_from_full_input(bytes, input);
     diag["prefilter_meter_ids"] = cfg.filter_meter_ids;
     diag["prefilter_attempted"] = true;
@@ -667,7 +674,7 @@ void process_payload(const std::string &topic, const std::string &payload, const
   }
   if (cfg.log_output_hex) diag["output_hex"] = out_hex;
 
-  if (!meter_allowed(meter_id_str)) {
+  if (meter_filter_enabled() && !meter_allowed(meter_id_str)) {
     stats.ignored++;
     diag["ok"] = false;
     diag["ignored"] = true;
@@ -694,8 +701,8 @@ void process_payload(const std::string &topic, const std::string &payload, const
          frame->data().size(), meter_ok ? " meter=" : "", meter_ok ? meter_id_str.c_str() : "");
     if (cfg.log_output_hex) logf("debug", "[HEX] %s", out_hex.c_str());
   } else {
-    logf("info", "[OK ] publish_output=false mode=%s format=%s len=%zu", link_mode_name(frame->link_mode()),
-         frame->format().c_str(), frame->data().size());
+    logf("info", "[OK ] publish_output=false mode=%s format=%s len=%zu%s%s", link_mode_name(frame->link_mode()),
+         frame->format().c_str(), frame->data().size(), meter_ok ? " meter=" : "", meter_ok ? meter_id_str.c_str() : "");
   }
 
   publish_diag_json(diag);
@@ -767,11 +774,12 @@ int main() {
        cfg.simulate_fifo ? "true" : "false", cfg.fifo_size, cfg.fifo_threshold,
        cfg.drop_tail_below_threshold ? "true" : "false");
   logf("info", "stats_every_n=%d stats_interval_s=%d", cfg.stats_every_n, cfg.stats_interval_s);
-  logf("info", "filters: input_len_min=%d input_len_max=%d input_lengths=%s meter_ids=%s prefilter_meter_ids=%s log_ignored=%s",
+  logf("info", "filters: input_len_min=%d input_len_max=%d input_lengths=%s meter_ids=%s prefilter_meter_ids=%s meter_filter_active=%s log_ignored=%s",
        cfg.filter_input_len_min, cfg.filter_input_len_max,
        cfg.filter_input_lengths.empty() ? "none" : cfg.filter_input_lengths.c_str(),
        cfg.filter_meter_ids.empty() ? "none" : cfg.filter_meter_ids.c_str(),
        cfg.prefilter_meter_ids ? "true" : "false",
+       meter_filter_enabled() ? "true" : "false",
        cfg.log_ignored ? "true" : "false");
 
   mosquitto_lib_init();

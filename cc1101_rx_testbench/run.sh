@@ -1,7 +1,7 @@
 #!/usr/bin/with-contenv bashio
 set -euo pipefail
 
-bashio::log.info "wMBus CC1101 RX Testbench run.sh 0.1.6"
+bashio::log.info "wMBus CC1101 RX Testbench run.sh 0.1.7"
 
 cfg() {
   local key="$1"
@@ -136,8 +136,8 @@ export LOG_LEVEL="$(cfg log_level info)"
 export FILTER_INPUT_LEN_MIN="$(cfg filter_input_len_min 0)"
 export FILTER_INPUT_LEN_MAX="$(cfg filter_input_len_max 0)"
 export FILTER_INPUT_LENGTHS="$(cfg filter_input_lengths '')"
-export FILTER_METER_IDS="$(cfg filter_meter_ids '12345678')"
-export PREFILTER_METER_IDS="$(cfg_bool prefilter_meter_ids true)"
+export FILTER_METER_IDS="$(cfg filter_meter_ids '')"
+export PREFILTER_METER_IDS="$(cfg_bool prefilter_meter_ids false)"
 export LOG_IGNORED="$(cfg_bool log_ignored false)"
 export STATS_EVERY_N="$(cfg stats_every_n 50)"
 export STATS_INTERVAL_S="$(cfg stats_interval_s 60)"

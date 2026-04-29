@@ -1,5 +1,5 @@
 name: wMBus CC1101 RX Testbench
-version: "0.1.6"
+version: "0.1.7"
 slug: wmbus_cc1101_rx_testbench
 description: Testbench for wMBus CC1101 RX logic using MQTT raw packets from ESP/SX1262
 url: https://github.com/Kustonium/homeassistant-wmbus-cc1101-rx-testbench
@@ -38,8 +38,8 @@ options:
   filter_input_len_min: 0
   filter_input_len_max: 0
   filter_input_lengths: ""
-  filter_meter_ids: "12345678"
-  prefilter_meter_ids: true
+  filter_meter_ids: ""
+  prefilter_meter_ids: false
   log_ignored: false
   stats_every_n: 50
   stats_interval_s: 60

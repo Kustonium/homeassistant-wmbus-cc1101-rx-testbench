@@ -5,7 +5,7 @@ Add this repository in Home Assistant add-on store, then install **wMBus CC1101 
 This is a development/test add-on, not a normal end-user integration.
 
 
-Current add-on version: 0.1.4 adds visible FIFO chunk logging, padded 8-digit meter IDs, and periodic RX statistics.
+Current add-on version: 0.1.7 defaults to whole-air processing and treats prefilter_meter_ids as the master switch for meter filtering.
 
 ## 0.1.6
 
@@ -28,7 +28,7 @@ log_ignored: false
 
 ## 0.1.6 fake-meter prefilter
 
-Default dev filter: `filter_meter_ids: "12345678"` and `prefilter_meter_ids: true`.
+Default: no meter filter. To isolate the fake TX meter, set `filter_meter_ids: "12345678"` and `prefilter_meter_ids: true`.
 The add-on first decodes the full raw input only to identify the meter ID, before FIFO/tail simulation. This keeps normal RF traffic out of the buffer test while still allowing `drop_tail_below_threshold: true` to intentionally truncate the selected fake meter afterwards.
 
-Set `filter_meter_ids: ""` to process all received meters again.
+To process all received meters, keep `filter_meter_ids: ""` or set `prefilter_meter_ids: false`.

@@ -117,7 +117,7 @@ Ignored packets are counted in `[STAT] ignored=...`. Set `log_ignored: true` onl
 
 ## 0.1.6 fake-meter prefilter
 
-Default dev filter: `filter_meter_ids: "12345678"` and `prefilter_meter_ids: true`.
+Default: no meter filter. To isolate the fake TX meter, set `filter_meter_ids: "12345678"` and `prefilter_meter_ids: true`.
 The add-on first decodes the full raw input only to identify the meter ID, before FIFO/tail simulation. This keeps normal RF traffic out of the buffer test while still allowing `drop_tail_below_threshold: true` to intentionally truncate the selected fake meter afterwards.
 
-Set `filter_meter_ids: ""` to process all received meters again.
+To process all received meters, keep `filter_meter_ids: ""` or set `prefilter_meter_ids: false`.
