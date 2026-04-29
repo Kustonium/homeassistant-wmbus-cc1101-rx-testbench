@@ -1,56 +1,70 @@
 #!/usr/bin/with-contenv bashio
 set -euo pipefail
 
+bashio::log.info "wMBus CC1101 RX Testbench run.sh 0.1.4"
+
 cfg() {
   local key="$1"
   local def="${2:-}"
+  local val=""
+
   if bashio::config.exists "$key"; then
-    bashio::config "$key"
+    val="$(bashio::config "$key" || true)"
   else
-    printf '%s' "$def"
+    val="$def"
   fi
+
+  if [[ "$val" == "null" ]]; then
+    val=""
+  fi
+
+  printf '%s' "$val"
 }
 
 cfg_bool() {
   local key="$1"
   local def="${2:-false}"
-  if bashio::config.exists "$key"; then
-    bashio::config "$key"
-  else
-    printf '%s' "$def"
-  fi
+  cfg "$key" "$def"
 }
 
-# New names follow the existing wMBus MQTT Bridge add-on convention:
-# external_mqtt_host / external_mqtt_port / external_mqtt_username / external_mqtt_password
-# Legacy mqtt_* names are still accepted for compatibility with 0.1.0/0.1.1.
 MQTT_MODE="$(cfg mqtt_mode auto)"
 
-MQTT_HOST="$(cfg external_mqtt_host '')"
-[[ -z "$MQTT_HOST" || "$MQTT_HOST" == "null" ]] && MQTT_HOST="$(cfg mqtt_host '')"
+# Keep the simple old option names visible in HA. Also accept external_* names
+# for compatibility with previous test packages.
+MQTT_HOST="$(cfg mqtt_host '')"
+[[ -z "$MQTT_HOST" ]] && MQTT_HOST="$(cfg external_mqtt_host '')"
 
-MQTT_PORT="$(cfg external_mqtt_port '')"
-[[ -z "$MQTT_PORT" || "$MQTT_PORT" == "null" ]] && MQTT_PORT="$(cfg mqtt_port 1883)"
+MQTT_PORT="$(cfg mqtt_port '')"
+[[ -z "$MQTT_PORT" ]] && MQTT_PORT="$(cfg external_mqtt_port 1883)"
+[[ -z "$MQTT_PORT" ]] && MQTT_PORT="1883"
 
-MQTT_USERNAME="$(cfg external_mqtt_username '')"
-[[ -z "$MQTT_USERNAME" || "$MQTT_USERNAME" == "null" ]] && MQTT_USERNAME="$(cfg mqtt_username '')"
+MQTT_USERNAME="$(cfg mqtt_username '')"
+[[ -z "$MQTT_USERNAME" ]] && MQTT_USERNAME="$(cfg external_mqtt_username '')"
 
-MQTT_PASSWORD="$(cfg external_mqtt_password '')"
-[[ -z "$MQTT_PASSWORD" || "$MQTT_PASSWORD" == "null" ]] && MQTT_PASSWORD="$(cfg mqtt_password '')"
+MQTT_PASSWORD="$(cfg mqtt_password '')"
+[[ -z "$MQTT_PASSWORD" ]] && MQTT_PASSWORD="$(cfg external_mqtt_password '')"
 
 use_ha_mqtt_service() {
   if ! bashio::services.available "mqtt"; then
+    bashio::log.warning "Home Assistant MQTT service is not available to this add-on."
     return 1
   fi
 
   bashio::log.info "MQTT service found, fetching credentials ..."
 
-  MQTT_HOST="$(bashio::services mqtt "host")"
-  MQTT_PORT="$(bashio::services mqtt "port")"
-  MQTT_USERNAME="$(bashio::services mqtt "username")"
-  MQTT_PASSWORD="$(bashio::services mqtt "password")"
+  MQTT_HOST="$(bashio::services mqtt "host" || true)"
+  MQTT_PORT="$(bashio::services mqtt "port" || true)"
+  MQTT_USERNAME="$(bashio::services mqtt "username" || true)"
+  MQTT_PASSWORD="$(bashio::services mqtt "password" || true)"
 
-  if [[ -z "$MQTT_HOST" || "$MQTT_HOST" == "null" ]]; then
+  [[ "$MQTT_HOST" == "null" ]] && MQTT_HOST=""
+  [[ "$MQTT_PORT" == "null" ]] && MQTT_PORT="1883"
+  [[ "$MQTT_USERNAME" == "null" ]] && MQTT_USERNAME=""
+  [[ "$MQTT_PASSWORD" == "null" ]] && MQTT_PASSWORD=""
+  [[ -z "$MQTT_PORT" ]] && MQTT_PORT="1883"
+
+  if [[ -z "$MQTT_HOST" ]]; then
+    bashio::log.warning "MQTT service exists, but returned an empty host."
     return 1
   fi
 
@@ -60,27 +74,26 @@ use_ha_mqtt_service() {
 use_core_mosquitto_fallback() {
   if getent hosts core-mosquitto >/dev/null 2>&1; then
     MQTT_HOST="core-mosquitto"
-    MQTT_PORT="${MQTT_PORT:-1883}"
-    bashio::log.warning "MQTT service discovery unavailable, but core-mosquitto resolves. Using core-mosquitto:${MQTT_PORT}."
-    bashio::log.warning "If the broker requires auth, set external_mqtt_username and external_mqtt_password."
+    [[ -z "$MQTT_PORT" ]] && MQTT_PORT="1883"
+    bashio::log.warning "Using DNS fallback core-mosquitto:${MQTT_PORT}."
+    bashio::log.warning "If auth is required, set mqtt_username and mqtt_password."
     return 0
   fi
-
   return 1
 }
 
 case "$MQTT_MODE" in
   ha)
     if ! use_ha_mqtt_service; then
-      bashio::log.error "mqtt_mode=ha, but Home Assistant MQTT service is not available."
-      bashio::log.error "Install/enable Mosquitto add-on or set mqtt_mode=external with external_mqtt_host."
+      bashio::log.error "mqtt_mode=ha, but Home Assistant MQTT service is unavailable or empty."
       exit 1
     fi
     ;;
 
   external)
-    if [[ -z "$MQTT_HOST" || "$MQTT_HOST" == "null" ]]; then
-      bashio::log.error "mqtt_mode=external, but external_mqtt_host is empty."
+    if [[ -z "$MQTT_HOST" ]]; then
+      bashio::log.error "mqtt_mode=external, but mqtt_host is empty."
+      bashio::log.error "Set mqtt_host, mqtt_port, mqtt_username and mqtt_password in add-on configuration."
       exit 1
     fi
     ;;
@@ -88,19 +101,19 @@ case "$MQTT_MODE" in
   auto)
     if use_ha_mqtt_service; then
       :
-    elif [[ -n "$MQTT_HOST" && "$MQTT_HOST" != "null" ]]; then
-      bashio::log.info "No HA MQTT service found, using configured external MQTT broker."
+    elif [[ -n "$MQTT_HOST" ]]; then
+      bashio::log.info "Using MQTT broker from add-on configuration."
     elif use_core_mosquitto_fallback; then
       :
     else
       bashio::log.error "MQTT host is empty."
-      bashio::log.error "Set mqtt_mode=external and external_mqtt_host, or enable the HA MQTT service."
+      bashio::log.error "Set mqtt_mode=external and mqtt_host, or enable the HA MQTT service."
       exit 1
     fi
     ;;
 
   *)
-    bashio::log.error "Invalid mqtt_mode: $MQTT_MODE"
+    bashio::log.error "Invalid mqtt_mode: ${MQTT_MODE}"
     exit 1
     ;;
 esac
@@ -120,10 +133,12 @@ export PUBLISH_DIAG="$(cfg_bool publish_diag true)"
 export LOG_RAW="$(cfg_bool log_raw false)"
 export LOG_OUTPUT_HEX="$(cfg_bool log_output_hex false)"
 export LOG_LEVEL="$(cfg log_level info)"
+export STATS_EVERY_N="$(cfg stats_every_n 50)"
+export STATS_INTERVAL_S="$(cfg stats_interval_s 60)"
 export REPLAY_FILE="$(cfg replay_file '')"
 export REPLAY_INTERVAL_MS="$(cfg replay_interval_ms 250)"
 
-bashio::log.info "MQTT: ${MQTT_HOST}:${MQTT_PORT} user=$([[ -n "$MQTT_USERNAME" ]] && echo yes || echo no)"
+bashio::log.info "MQTT: ${MQTT_HOST}:${MQTT_PORT} user=$([[ -n "${MQTT_USERNAME}" ]] && echo yes || echo no)"
 bashio::log.info "input=${INPUT_TOPIC} output=${OUTPUT_TOPIC} diag=${DIAG_TOPIC}"
 
 exec /usr/bin/cc1101_rx_testbench

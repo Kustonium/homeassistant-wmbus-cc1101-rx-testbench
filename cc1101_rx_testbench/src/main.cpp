@@ -8,7 +8,10 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <cstdio>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -48,12 +51,33 @@ struct Config {
   bool log_raw{false};
   bool log_output_hex{false};
   std::string log_level{"info"};
+  int stats_every_n{50};
+  int stats_interval_s{60};
   std::string replay_file{};
   int replay_interval_ms{250};
 };
 
 Config cfg;
 mosquitto *g_mosq = nullptr;
+
+struct Stats {
+  uint64_t rx{0};
+  uint64_t ok{0};
+  uint64_t drop{0};
+  uint64_t parse_fail{0};
+  uint64_t hex_fail{0};
+  uint64_t decode_fail{0};
+  uint64_t crc_fail{0};
+  uint64_t truncated{0};
+  uint64_t tail_dropped{0};
+  uint64_t invalid_symbols{0};
+  uint64_t input_bytes{0};
+  uint64_t delivered_bytes{0};
+  uint64_t output_bytes{0};
+  std::chrono::steady_clock::time_point last_report{std::chrono::steady_clock::now()};
+};
+
+Stats stats;
 
 int level_rank(const std::string &level) {
   if (level == "error") return 0;
@@ -121,12 +145,16 @@ void load_config_from_env() {
   cfg.log_raw = getenv_bool("LOG_RAW", cfg.log_raw);
   cfg.log_output_hex = getenv_bool("LOG_OUTPUT_HEX", cfg.log_output_hex);
   cfg.log_level = getenv_str("LOG_LEVEL", cfg.log_level);
+  cfg.stats_every_n = getenv_int("STATS_EVERY_N", cfg.stats_every_n);
+  cfg.stats_interval_s = getenv_int("STATS_INTERVAL_S", cfg.stats_interval_s);
   cfg.replay_file = getenv_str("REPLAY_FILE", cfg.replay_file);
   cfg.replay_interval_ms = getenv_int("REPLAY_INTERVAL_MS", cfg.replay_interval_ms);
 
   if (cfg.fifo_size < 1) cfg.fifo_size = 64;
   if (cfg.fifo_threshold < 1) cfg.fifo_threshold = 32;
   if (cfg.fifo_threshold > cfg.fifo_size) cfg.fifo_threshold = cfg.fifo_size;
+  if (cfg.stats_every_n < 0) cfg.stats_every_n = 0;
+  if (cfg.stats_interval_s < 0) cfg.stats_interval_s = 0;
 }
 
 std::string trim(const std::string &s) {
@@ -203,6 +231,69 @@ std::string join_chunks(const std::vector<size_t> &chunks) {
     oss << chunks[i];
   }
   return oss.str();
+}
+
+std::string meter_id_8(uint32_t meter_id) {
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%08u", static_cast<unsigned>(meter_id));
+  return std::string(buf);
+}
+
+size_t fifo_tail_bytes(size_t len) {
+  if (!cfg.simulate_fifo || cfg.fifo_threshold <= 0) return 0;
+  const size_t threshold = static_cast<size_t>(cfg.fifo_threshold);
+  return len % threshold;
+}
+
+void mqtt_publish_str(const std::string &topic, const std::string &payload, bool retain = false);
+
+void report_stats(bool force = false) {
+  if (stats.rx == 0) return;
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - stats.last_report).count();
+  const bool by_count = cfg.stats_every_n > 0 && (stats.rx % static_cast<uint64_t>(cfg.stats_every_n) == 0);
+  const bool by_time = cfg.stats_interval_s > 0 && elapsed_s >= cfg.stats_interval_s;
+  if (!force && !by_count && !by_time) return;
+
+  const double ok_pct = stats.rx ? (100.0 * static_cast<double>(stats.ok) / static_cast<double>(stats.rx)) : 0.0;
+  logf("info", "[STAT] rx=%llu ok=%llu drop=%llu parse_fail=%llu hex_fail=%llu decode_fail=%llu crc_fail=%llu truncated=%llu tail_dropped=%llu invalid_symbols=%llu in_bytes=%llu delivered_bytes=%llu out_bytes=%llu ok_pct=%.1f%%",
+       static_cast<unsigned long long>(stats.rx),
+       static_cast<unsigned long long>(stats.ok),
+       static_cast<unsigned long long>(stats.drop),
+       static_cast<unsigned long long>(stats.parse_fail),
+       static_cast<unsigned long long>(stats.hex_fail),
+       static_cast<unsigned long long>(stats.decode_fail),
+       static_cast<unsigned long long>(stats.crc_fail),
+       static_cast<unsigned long long>(stats.truncated),
+       static_cast<unsigned long long>(stats.tail_dropped),
+       static_cast<unsigned long long>(stats.invalid_symbols),
+       static_cast<unsigned long long>(stats.input_bytes),
+       static_cast<unsigned long long>(stats.delivered_bytes),
+       static_cast<unsigned long long>(stats.output_bytes),
+       ok_pct);
+
+  if (cfg.publish_diag) {
+    json j;
+    j["event"] = "cc1101_rx_testbench_stats";
+    j["rx"] = stats.rx;
+    j["ok"] = stats.ok;
+    j["drop"] = stats.drop;
+    j["parse_fail"] = stats.parse_fail;
+    j["hex_fail"] = stats.hex_fail;
+    j["decode_fail"] = stats.decode_fail;
+    j["crc_fail"] = stats.crc_fail;
+    j["truncated"] = stats.truncated;
+    j["tail_dropped"] = stats.tail_dropped;
+    j["invalid_symbols"] = stats.invalid_symbols;
+    j["input_bytes"] = stats.input_bytes;
+    j["delivered_bytes"] = stats.delivered_bytes;
+    j["output_bytes"] = stats.output_bytes;
+    j["ok_pct"] = ok_pct;
+    mqtt_publish_str(cfg.diag_topic, j.dump(), false);
+  }
+
+  stats.last_report = now;
 }
 
 struct InputFrame {
@@ -282,7 +373,7 @@ std::vector<uint8_t> apply_fifo_sim(const std::vector<uint8_t> &bytes, std::vect
   return out;
 }
 
-void mqtt_publish_str(const std::string &topic, const std::string &payload, bool retain = false) {
+void mqtt_publish_str(const std::string &topic, const std::string &payload, bool retain) {
   if (g_mosq == nullptr || topic.empty()) return;
   mosquitto_publish(g_mosq, nullptr, topic.c_str(), static_cast<int>(payload.size()), payload.data(), 0, retain);
 }
@@ -293,6 +384,8 @@ void publish_diag_json(const json &diag) {
 }
 
 void process_payload(const std::string &topic, const std::string &payload, const char *origin = "mqtt") {
+  stats.rx++;
+
   InputFrame input;
   std::string err;
   json diag;
@@ -305,7 +398,10 @@ void process_payload(const std::string &topic, const std::string &payload, const
     diag["ok"] = false;
     diag["drop_stage"] = "input_parse";
     diag["drop_reason"] = err;
+    stats.drop++;
+    stats.parse_fail++;
     publish_diag_json(diag);
+    report_stats();
     return;
   }
 
@@ -316,13 +412,21 @@ void process_payload(const std::string &topic, const std::string &payload, const
     diag["drop_stage"] = "hex_parse";
     diag["drop_reason"] = err;
     diag["raw_hex_len"] = input.raw_hex.size();
+    stats.drop++;
+    stats.hex_fail++;
     publish_diag_json(diag);
+    report_stats();
     return;
   }
 
   std::vector<size_t> chunks;
   bool tail_dropped = false;
   std::vector<uint8_t> delivered = apply_fifo_sim(bytes, chunks, tail_dropped);
+  const size_t tail_bytes = fifo_tail_bytes(bytes.size());
+
+  stats.input_bytes += bytes.size();
+  stats.delivered_bytes += delivered.size();
+  if (tail_dropped) stats.tail_dropped++;
 
   Packet packet;
   if (input.rssi_set) packet.set_rssi(static_cast<int8_t>(std::clamp(input.rssi, -128, 127)));
@@ -341,6 +445,7 @@ void process_payload(const std::string &topic, const std::string &payload, const
   diag["fifo_size"] = cfg.fifo_size;
   diag["fifo_threshold"] = cfg.fifo_threshold;
   diag["chunks"] = join_chunks(chunks);
+  diag["tail_bytes"] = tail_bytes;
   diag["tail_dropped"] = tail_dropped;
   diag["raw_got_len"] = packet.raw_got_len();
   diag["decoded_len"] = packet.decoded_len();
@@ -359,9 +464,9 @@ void process_payload(const std::string &topic, const std::string &payload, const
   logf("info", "[IN ] origin=%s topic=%s chip=%s mode=%s rssi=%s input_len=%zu delivered_len=%zu",
        origin, topic.c_str(), input.chip.c_str(), input.mode.c_str(),
        input.rssi_set ? std::to_string(input.rssi).c_str() : "n/a", bytes.size(), delivered.size());
-  logf("debug", "[SIM] fifo=%s size=%d threshold=%d chunks=%s tail_dropped=%s",
+  logf("info", "[SIM] fifo=%s size=%d threshold=%d chunks=%s tail=%zu delivered_len=%zu tail_dropped=%s",
        cfg.simulate_fifo ? "on" : "off", cfg.fifo_size, cfg.fifo_threshold,
-       join_chunks(chunks).c_str(), tail_dropped ? "true" : "false");
+       join_chunks(chunks).c_str(), tail_bytes, delivered.size(), tail_dropped ? "true" : "false");
 
   if (!frame) {
     diag["ok"] = false;
@@ -369,30 +474,44 @@ void process_payload(const std::string &topic, const std::string &payload, const
     diag["drop_reason"] = packet.drop_reason();
     diag["drop_detail"] = packet.drop_detail();
     diag["truncated"] = packet.is_truncated();
+    stats.drop++;
+    if (packet.drop_reason() == "dll_crc_failed" || packet.drop_stage().rfind("dll_crc", 0) == 0) stats.crc_fail++;
+    else stats.decode_fail++;
+    if (packet.is_truncated()) stats.truncated++;
+    stats.invalid_symbols += packet.t1_symbols_invalid();
     logf("warn", "[DROP] stage=%s reason=%s detail=%s truncated=%s",
          packet.drop_stage().c_str(), packet.drop_reason().c_str(), packet.drop_detail().c_str(),
          packet.is_truncated() ? "true" : "false");
     publish_diag_json(diag);
+    report_stats();
     return;
   }
 
   std::string out_hex = frame->as_hex();
   uint32_t meter_id = 0;
   const bool meter_ok = frame->try_get_meter_id(meter_id);
+  const std::string meter_id_str = meter_ok ? meter_id_8(meter_id) : std::string();
 
   diag["ok"] = true;
   diag["link_mode"] = link_mode_name(frame->link_mode());
   diag["format"] = frame->format();
   diag["output_bytes"] = frame->data().size();
   diag["output_topic"] = cfg.output_topic;
-  if (meter_ok) diag["meter_id"] = meter_id;
+  if (meter_ok) {
+    diag["meter_id"] = meter_id_str;
+    diag["meter_id_numeric"] = meter_id;
+  }
   if (cfg.log_output_hex) diag["output_hex"] = out_hex;
+
+  stats.ok++;
+  stats.output_bytes += frame->data().size();
+  stats.invalid_symbols += packet.t1_symbols_invalid();
 
   if (cfg.publish_output) {
     mqtt_publish_str(cfg.output_topic, out_hex, false);
-    logf("info", "[OUT] topic=%s mode=%s format=%s len=%zu%s",
+    logf("info", "[OUT] topic=%s mode=%s format=%s len=%zu%s%s",
          cfg.output_topic.c_str(), link_mode_name(frame->link_mode()), frame->format().c_str(),
-         frame->data().size(), meter_ok ? (std::string(" meter=") + std::to_string(meter_id)).c_str() : "");
+         frame->data().size(), meter_ok ? " meter=" : "", meter_ok ? meter_id_str.c_str() : "");
     if (cfg.log_output_hex) logf("debug", "[HEX] %s", out_hex.c_str());
   } else {
     logf("info", "[OK ] publish_output=false mode=%s format=%s len=%zu", link_mode_name(frame->link_mode()),
@@ -400,6 +519,7 @@ void process_payload(const std::string &topic, const std::string &payload, const
   }
 
   publish_diag_json(diag);
+  report_stats();
 }
 
 void on_connect(struct mosquitto *, void *, int rc) {
@@ -466,6 +586,7 @@ int main() {
   logf("info", "fifo_sim=%s fifo_size=%d threshold=%d drop_tail_below_threshold=%s",
        cfg.simulate_fifo ? "true" : "false", cfg.fifo_size, cfg.fifo_threshold,
        cfg.drop_tail_below_threshold ? "true" : "false");
+  logf("info", "stats_every_n=%d stats_interval_s=%d", cfg.stats_every_n, cfg.stats_interval_s);
 
   mosquitto_lib_init();
   g_mosq = mosquitto_new(cfg.client_id.c_str(), true, nullptr);
@@ -505,6 +626,7 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }
 
+  report_stats(true);
   logf("info", "Stopping");
   mosquitto_loop_stop(g_mosq, true);
   mosquitto_destroy(g_mosq);
