@@ -1,67 +1,129 @@
-#!/usr/bin/env bash
+#!/usr/bin/with-contenv bashio
 set -euo pipefail
 
-OPTIONS=/data/options.json
-
-json_get() {
+cfg() {
   local key="$1"
   local def="${2:-}"
-  jq -r --arg key "$key" --arg def "$def" '.[$key] // $def' "$OPTIONS"
+  if bashio::config.exists "$key"; then
+    bashio::config "$key"
+  else
+    printf '%s' "$def"
+  fi
 }
 
-json_bool() {
+cfg_bool() {
   local key="$1"
   local def="${2:-false}"
-  jq -r --arg key "$key" --argjson def "$def" '.[$key] // $def' "$OPTIONS"
+  if bashio::config.exists "$key"; then
+    bashio::config "$key"
+  else
+    printf '%s' "$def"
+  fi
 }
 
-MQTT_MODE="$(json_get mqtt_mode auto)"
-MQTT_HOST="$(json_get mqtt_host '')"
-MQTT_PORT="$(json_get mqtt_port 1883)"
-MQTT_USERNAME="$(json_get mqtt_username '')"
-MQTT_PASSWORD="$(json_get mqtt_password '')"
+# New names follow the existing wMBus MQTT Bridge add-on convention:
+# external_mqtt_host / external_mqtt_port / external_mqtt_username / external_mqtt_password
+# Legacy mqtt_* names are still accepted for compatibility with 0.1.0/0.1.1.
+MQTT_MODE="$(cfg mqtt_mode auto)"
 
-if [[ "$MQTT_MODE" == "auto" || "$MQTT_MODE" == "ha" ]]; then
-  echo "[wmbus-cc1101-testbench] Trying Home Assistant MQTT service discovery..."
-  if [[ -n "${SUPERVISOR_TOKEN:-}" ]]; then
-    MQTT_JSON="$(curl -fsS -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/services/mqtt || true)"
-    if [[ -n "$MQTT_JSON" && "$MQTT_JSON" != "null" ]]; then
-      MQTT_HOST_DISC="$(echo "$MQTT_JSON" | jq -r '.data.host // empty')"
-      MQTT_PORT_DISC="$(echo "$MQTT_JSON" | jq -r '.data.port // empty')"
-      MQTT_USERNAME_DISC="$(echo "$MQTT_JSON" | jq -r '.data.username // empty')"
-      MQTT_PASSWORD_DISC="$(echo "$MQTT_JSON" | jq -r '.data.password // empty')"
-      [[ -n "$MQTT_HOST_DISC" ]] && MQTT_HOST="$MQTT_HOST_DISC"
-      [[ -n "$MQTT_PORT_DISC" ]] && MQTT_PORT="$MQTT_PORT_DISC"
-      [[ -n "$MQTT_USERNAME_DISC" ]] && MQTT_USERNAME="$MQTT_USERNAME_DISC"
-      [[ -n "$MQTT_PASSWORD_DISC" ]] && MQTT_PASSWORD="$MQTT_PASSWORD_DISC"
-    fi
+MQTT_HOST="$(cfg external_mqtt_host '')"
+[[ -z "$MQTT_HOST" || "$MQTT_HOST" == "null" ]] && MQTT_HOST="$(cfg mqtt_host '')"
+
+MQTT_PORT="$(cfg external_mqtt_port '')"
+[[ -z "$MQTT_PORT" || "$MQTT_PORT" == "null" ]] && MQTT_PORT="$(cfg mqtt_port 1883)"
+
+MQTT_USERNAME="$(cfg external_mqtt_username '')"
+[[ -z "$MQTT_USERNAME" || "$MQTT_USERNAME" == "null" ]] && MQTT_USERNAME="$(cfg mqtt_username '')"
+
+MQTT_PASSWORD="$(cfg external_mqtt_password '')"
+[[ -z "$MQTT_PASSWORD" || "$MQTT_PASSWORD" == "null" ]] && MQTT_PASSWORD="$(cfg mqtt_password '')"
+
+use_ha_mqtt_service() {
+  if ! bashio::services.available "mqtt"; then
+    return 1
   fi
-fi
 
-if [[ -z "$MQTT_HOST" ]]; then
-  echo "[wmbus-cc1101-testbench] ERROR: MQTT host is empty. Set mqtt_mode=external and mqtt_host, or enable HA MQTT service." >&2
-  exit 1
-fi
+  bashio::log.info "MQTT service found, fetching credentials ..."
+
+  MQTT_HOST="$(bashio::services mqtt "host")"
+  MQTT_PORT="$(bashio::services mqtt "port")"
+  MQTT_USERNAME="$(bashio::services mqtt "username")"
+  MQTT_PASSWORD="$(bashio::services mqtt "password")"
+
+  if [[ -z "$MQTT_HOST" || "$MQTT_HOST" == "null" ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+use_core_mosquitto_fallback() {
+  if getent hosts core-mosquitto >/dev/null 2>&1; then
+    MQTT_HOST="core-mosquitto"
+    MQTT_PORT="${MQTT_PORT:-1883}"
+    bashio::log.warning "MQTT service discovery unavailable, but core-mosquitto resolves. Using core-mosquitto:${MQTT_PORT}."
+    bashio::log.warning "If the broker requires auth, set external_mqtt_username and external_mqtt_password."
+    return 0
+  fi
+
+  return 1
+}
+
+case "$MQTT_MODE" in
+  ha)
+    if ! use_ha_mqtt_service; then
+      bashio::log.error "mqtt_mode=ha, but Home Assistant MQTT service is not available."
+      bashio::log.error "Install/enable Mosquitto add-on or set mqtt_mode=external with external_mqtt_host."
+      exit 1
+    fi
+    ;;
+
+  external)
+    if [[ -z "$MQTT_HOST" || "$MQTT_HOST" == "null" ]]; then
+      bashio::log.error "mqtt_mode=external, but external_mqtt_host is empty."
+      exit 1
+    fi
+    ;;
+
+  auto)
+    if use_ha_mqtt_service; then
+      :
+    elif [[ -n "$MQTT_HOST" && "$MQTT_HOST" != "null" ]]; then
+      bashio::log.info "No HA MQTT service found, using configured external MQTT broker."
+    elif use_core_mosquitto_fallback; then
+      :
+    else
+      bashio::log.error "MQTT host is empty."
+      bashio::log.error "Set mqtt_mode=external and external_mqtt_host, or enable the HA MQTT service."
+      exit 1
+    fi
+    ;;
+
+  *)
+    bashio::log.error "Invalid mqtt_mode: $MQTT_MODE"
+    exit 1
+    ;;
+esac
 
 export MQTT_HOST MQTT_PORT MQTT_USERNAME MQTT_PASSWORD
 export MQTT_CLIENT_ID="wmbus_cc1101_rx_testbench_$(hostname)"
-export INPUT_TOPIC="$(json_get input_topic 'wmbus_bridge/raw')"
-export OUTPUT_TOPIC="$(json_get output_topic 'wmbus_bridge/telegram_cc1101_sim')"
-export DIAG_TOPIC="$(json_get diag_topic 'wmbus/diag/cc1101_sim')"
-export LISTEN_MODE_HINT="$(json_get listen_mode_hint auto)"
-export SIMULATE_FIFO="$(json_bool simulate_fifo true)"
-export FIFO_SIZE="$(json_get fifo_size 64)"
-export FIFO_THRESHOLD="$(json_get fifo_threshold 32)"
-export DROP_TAIL_BELOW_THRESHOLD="$(json_bool drop_tail_below_threshold false)"
-export PUBLISH_OUTPUT="$(json_bool publish_output true)"
-export PUBLISH_DIAG="$(json_bool publish_diag true)"
-export LOG_RAW="$(json_bool log_raw false)"
-export LOG_OUTPUT_HEX="$(json_bool log_output_hex false)"
-export LOG_LEVEL="$(json_get log_level info)"
-export REPLAY_FILE="$(json_get replay_file '')"
-export REPLAY_INTERVAL_MS="$(json_get replay_interval_ms 250)"
+export INPUT_TOPIC="$(cfg input_topic 'wmbus_bridge/raw')"
+export OUTPUT_TOPIC="$(cfg output_topic 'wmbus_bridge/telegram_cc1101_sim')"
+export DIAG_TOPIC="$(cfg diag_topic 'wmbus/diag/cc1101_sim')"
+export LISTEN_MODE_HINT="$(cfg listen_mode_hint auto)"
+export SIMULATE_FIFO="$(cfg_bool simulate_fifo true)"
+export FIFO_SIZE="$(cfg fifo_size 64)"
+export FIFO_THRESHOLD="$(cfg fifo_threshold 32)"
+export DROP_TAIL_BELOW_THRESHOLD="$(cfg_bool drop_tail_below_threshold false)"
+export PUBLISH_OUTPUT="$(cfg_bool publish_output true)"
+export PUBLISH_DIAG="$(cfg_bool publish_diag true)"
+export LOG_RAW="$(cfg_bool log_raw false)"
+export LOG_OUTPUT_HEX="$(cfg_bool log_output_hex false)"
+export LOG_LEVEL="$(cfg log_level info)"
+export REPLAY_FILE="$(cfg replay_file '')"
+export REPLAY_INTERVAL_MS="$(cfg replay_interval_ms 250)"
 
-echo "[wmbus-cc1101-testbench] MQTT: ${MQTT_HOST}:${MQTT_PORT} user=$([[ -n "$MQTT_USERNAME" ]] && echo yes || echo no)"
-echo "[wmbus-cc1101-testbench] input=${INPUT_TOPIC} output=${OUTPUT_TOPIC} diag=${DIAG_TOPIC}"
+bashio::log.info "MQTT: ${MQTT_HOST}:${MQTT_PORT} user=$([[ -n "$MQTT_USERNAME" ]] && echo yes || echo no)"
+bashio::log.info "input=${INPUT_TOPIC} output=${OUTPUT_TOPIC} diag=${DIAG_TOPIC}"
 
 exec /usr/bin/cc1101_rx_testbench

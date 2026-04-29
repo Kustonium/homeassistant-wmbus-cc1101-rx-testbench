@@ -1,5 +1,5 @@
 name: wMBus CC1101 RX Testbench
-version: "0.1.0"
+version: "0.1.2"
 slug: wmbus_cc1101_rx_testbench
 description: Testbench for wMBus CC1101 RX logic using MQTT raw packets from ESP/SX1262
 url: https://github.com/Kustonium/homeassistant-wmbus-cc1101-rx-testbench
@@ -11,17 +11,16 @@ arch:
 startup: services
 boot: manual
 init: false
-hassio_api: true
 services:
-  - mqtt:need
+  - mqtt:want
 map:
   - share:rw
 options:
   mqtt_mode: auto
-  mqtt_host: ""
-  mqtt_port: 1883
-  mqtt_username: ""
-  mqtt_password: ""
+  external_mqtt_host: ""
+  external_mqtt_port: 1883
+  external_mqtt_username: ""
+  external_mqtt_password: ""
   input_topic: "wmbus_bridge/raw"
   output_topic: "wmbus_bridge/telegram_cc1101_sim"
   diag_topic: "wmbus/diag/cc1101_sim"
@@ -39,8 +38,13 @@ options:
   replay_interval_ms: 250
 schema:
   mqtt_mode: list(auto|ha|external)
+  external_mqtt_host: str?
+  external_mqtt_port: port
+  external_mqtt_username: str?
+  external_mqtt_password: password?
+  # Legacy names accepted for compatibility with 0.1.0/0.1.1.
   mqtt_host: str?
-  mqtt_port: port
+  mqtt_port: port?
   mqtt_username: str?
   mqtt_password: password?
   input_topic: str
