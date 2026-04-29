@@ -89,3 +89,35 @@ Configuration:
 stats_every_n: 50       # 0 disables count-based reports
 stats_interval_s: 60    # 0 disables time-based reports
 ```
+
+## 0.1.6 crowded-air filters
+
+When the air is full of real meters and you only want to process synthetic TX frames, enable input filtering.
+
+For the long synthetic raw packet visible as `input_len=435`:
+
+```yaml
+filter_input_len_min: 400
+filter_input_len_max: 500
+# or exact-length mode:
+# filter_input_lengths: "435"
+log_ignored: false
+```
+
+With this setting the add-on silently ignores normal 134/245 byte packets and only runs the RX/FIFO test on long frames.
+
+Optional exact meter filter, after successful decoding:
+
+```yaml
+filter_meter_ids: "00089907,03534157"
+```
+
+Ignored packets are counted in `[STAT] ignored=...`. Set `log_ignored: true` only when debugging the filter itself; otherwise leave it disabled to keep the log clean.
+
+
+## 0.1.6 fake-meter prefilter
+
+Default dev filter: `filter_meter_ids: "12345678"` and `prefilter_meter_ids: true`.
+The add-on first decodes the full raw input only to identify the meter ID, before FIFO/tail simulation. This keeps normal RF traffic out of the buffer test while still allowing `drop_tail_below_threshold: true` to intentionally truncate the selected fake meter afterwards.
+
+Set `filter_meter_ids: ""` to process all received meters again.

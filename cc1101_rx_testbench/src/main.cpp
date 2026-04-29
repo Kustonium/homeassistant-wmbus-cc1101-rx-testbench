@@ -51,6 +51,12 @@ struct Config {
   bool log_raw{false};
   bool log_output_hex{false};
   std::string log_level{"info"};
+  int filter_input_len_min{0};
+  int filter_input_len_max{0};
+  std::string filter_input_lengths{};
+  std::string filter_meter_ids{};
+  bool prefilter_meter_ids{true};
+  bool log_ignored{false};
   int stats_every_n{50};
   int stats_interval_s{60};
   std::string replay_file{};
@@ -70,6 +76,7 @@ struct Stats {
   uint64_t crc_fail{0};
   uint64_t truncated{0};
   uint64_t tail_dropped{0};
+  uint64_t ignored{0};
   uint64_t invalid_symbols{0};
   uint64_t input_bytes{0};
   uint64_t delivered_bytes{0};
@@ -145,6 +152,12 @@ void load_config_from_env() {
   cfg.log_raw = getenv_bool("LOG_RAW", cfg.log_raw);
   cfg.log_output_hex = getenv_bool("LOG_OUTPUT_HEX", cfg.log_output_hex);
   cfg.log_level = getenv_str("LOG_LEVEL", cfg.log_level);
+  cfg.filter_input_len_min = getenv_int("FILTER_INPUT_LEN_MIN", cfg.filter_input_len_min);
+  cfg.filter_input_len_max = getenv_int("FILTER_INPUT_LEN_MAX", cfg.filter_input_len_max);
+  cfg.filter_input_lengths = getenv_str("FILTER_INPUT_LENGTHS", cfg.filter_input_lengths);
+  cfg.filter_meter_ids = getenv_str("FILTER_METER_IDS", cfg.filter_meter_ids);
+  cfg.prefilter_meter_ids = getenv_bool("PREFILTER_METER_IDS", cfg.prefilter_meter_ids);
+  cfg.log_ignored = getenv_bool("LOG_IGNORED", cfg.log_ignored);
   cfg.stats_every_n = getenv_int("STATS_EVERY_N", cfg.stats_every_n);
   cfg.stats_interval_s = getenv_int("STATS_INTERVAL_S", cfg.stats_interval_s);
   cfg.replay_file = getenv_str("REPLAY_FILE", cfg.replay_file);
@@ -153,6 +166,9 @@ void load_config_from_env() {
   if (cfg.fifo_size < 1) cfg.fifo_size = 64;
   if (cfg.fifo_threshold < 1) cfg.fifo_threshold = 32;
   if (cfg.fifo_threshold > cfg.fifo_size) cfg.fifo_threshold = cfg.fifo_size;
+  if (cfg.filter_input_len_min < 0) cfg.filter_input_len_min = 0;
+  if (cfg.filter_input_len_max < 0) cfg.filter_input_len_max = 0;
+  if (cfg.filter_input_len_max > 0 && cfg.filter_input_len_min > cfg.filter_input_len_max) cfg.filter_input_len_max = cfg.filter_input_len_min;
   if (cfg.stats_every_n < 0) cfg.stats_every_n = 0;
   if (cfg.stats_interval_s < 0) cfg.stats_interval_s = 0;
 }
@@ -245,6 +261,68 @@ size_t fifo_tail_bytes(size_t len) {
   return len % threshold;
 }
 
+std::vector<std::string> split_csv(std::string s) {
+  for (char &c : s) {
+    if (c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r') c = ',';
+  }
+  std::vector<std::string> out;
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    item = trim(item);
+    if (!item.empty()) out.push_back(item);
+  }
+  return out;
+}
+
+bool csv_contains_int(const std::string &csv, int value) {
+  if (csv.empty()) return false;
+  for (const auto &item : split_csv(csv)) {
+    try {
+      if (std::stoi(item) == value) return true;
+    } catch (...) {}
+  }
+  return false;
+}
+
+bool input_length_allowed(size_t len, std::string &reason) {
+  if (cfg.filter_input_len_min > 0 && len < static_cast<size_t>(cfg.filter_input_len_min)) {
+    reason = "input_len_below_min";
+    return false;
+  }
+  if (cfg.filter_input_len_max > 0 && len > static_cast<size_t>(cfg.filter_input_len_max)) {
+    reason = "input_len_above_max";
+    return false;
+  }
+  if (!cfg.filter_input_lengths.empty() && !csv_contains_int(cfg.filter_input_lengths, static_cast<int>(len))) {
+    reason = "input_len_not_allowed";
+    return false;
+  }
+  return true;
+}
+
+bool meter_allowed(const std::string &meter_id) {
+  if (cfg.filter_meter_ids.empty()) return true;
+  for (auto item : split_csv(cfg.filter_meter_ids)) {
+    item = normalize_hex(item);
+    if (item.size() < 8 && std::all_of(item.begin(), item.end(), [](unsigned char c){ return std::isdigit(c); })) {
+      item = std::string(8 - item.size(), '0') + item;
+    }
+    if (item == meter_id) return true;
+  }
+  return false;
+}
+
+struct PrefilterResult {
+  bool attempted{false};
+  bool frame_ok{false};
+  bool meter_ok{false};
+  std::string meter_id{};
+  std::string drop_stage{};
+  std::string drop_reason{};
+  std::string drop_detail{};
+};
+
 void mqtt_publish_str(const std::string &topic, const std::string &payload, bool retain = false);
 
 void report_stats(bool force = false) {
@@ -257,10 +335,11 @@ void report_stats(bool force = false) {
   if (!force && !by_count && !by_time) return;
 
   const double ok_pct = stats.rx ? (100.0 * static_cast<double>(stats.ok) / static_cast<double>(stats.rx)) : 0.0;
-  logf("info", "[STAT] rx=%llu ok=%llu drop=%llu parse_fail=%llu hex_fail=%llu decode_fail=%llu crc_fail=%llu truncated=%llu tail_dropped=%llu invalid_symbols=%llu in_bytes=%llu delivered_bytes=%llu out_bytes=%llu ok_pct=%.1f%%",
+  logf("info", "[STAT] rx=%llu ok=%llu drop=%llu ignored=%llu parse_fail=%llu hex_fail=%llu decode_fail=%llu crc_fail=%llu truncated=%llu tail_dropped=%llu invalid_symbols=%llu in_bytes=%llu delivered_bytes=%llu out_bytes=%llu ok_pct=%.1f%%",
        static_cast<unsigned long long>(stats.rx),
        static_cast<unsigned long long>(stats.ok),
        static_cast<unsigned long long>(stats.drop),
+       static_cast<unsigned long long>(stats.ignored),
        static_cast<unsigned long long>(stats.parse_fail),
        static_cast<unsigned long long>(stats.hex_fail),
        static_cast<unsigned long long>(stats.decode_fail),
@@ -279,6 +358,7 @@ void report_stats(bool force = false) {
     j["rx"] = stats.rx;
     j["ok"] = stats.ok;
     j["drop"] = stats.drop;
+    j["ignored"] = stats.ignored;
     j["parse_fail"] = stats.parse_fail;
     j["hex_fail"] = stats.hex_fail;
     j["decode_fail"] = stats.decode_fail;
@@ -305,6 +385,32 @@ struct InputFrame {
   bool rssi_set{false};
   json original{};
 };
+
+PrefilterResult decode_meter_from_full_input(const std::vector<uint8_t> &bytes, const InputFrame &input) {
+  PrefilterResult r;
+  r.attempted = true;
+
+  Packet packet;
+  if (input.rssi_set) packet.set_rssi(static_cast<int8_t>(std::clamp(input.rssi, -128, 127)));
+  auto *dst = packet.append_space(bytes.size());
+  if (!bytes.empty()) std::memcpy(dst, bytes.data(), bytes.size());
+
+  auto frame = packet.convert_to_frame();
+  if (!frame) {
+    r.drop_stage = packet.drop_stage();
+    r.drop_reason = packet.drop_reason();
+    r.drop_detail = packet.drop_detail();
+    return r;
+  }
+
+  r.frame_ok = true;
+  uint32_t meter_id = 0;
+  if (frame->try_get_meter_id(meter_id)) {
+    r.meter_ok = true;
+    r.meter_id = meter_id_8(meter_id);
+  }
+  return r;
+}
 
 bool parse_input_payload(const std::string &payload, InputFrame &in, std::string &err) {
   std::string p = trim(payload);
@@ -419,6 +525,63 @@ void process_payload(const std::string &topic, const std::string &payload, const
     return;
   }
 
+  std::string filter_reason;
+  if (!input_length_allowed(bytes.size(), filter_reason)) {
+    stats.ignored++;
+    stats.input_bytes += bytes.size();
+    diag["ok"] = false;
+    diag["ignored"] = true;
+    diag["ignore_stage"] = "input_length_filter";
+    diag["ignore_reason"] = filter_reason;
+    diag["input_bytes"] = bytes.size();
+    diag["filter_input_len_min"] = cfg.filter_input_len_min;
+    diag["filter_input_len_max"] = cfg.filter_input_len_max;
+    diag["filter_input_lengths"] = cfg.filter_input_lengths;
+    if (cfg.log_ignored) {
+      logf("info", "[IGN] stage=input_length_filter reason=%s topic=%s chip=%s mode=%s rssi=%s input_len=%zu",
+           filter_reason.c_str(), topic.c_str(), input.chip.c_str(), input.mode.c_str(),
+           input.rssi_set ? std::to_string(input.rssi).c_str() : "n/a", bytes.size());
+      publish_diag_json(diag);
+    }
+    report_stats();
+    return;
+  }
+
+  PrefilterResult prefilter;
+  if (cfg.prefilter_meter_ids && !cfg.filter_meter_ids.empty()) {
+    prefilter = decode_meter_from_full_input(bytes, input);
+    diag["prefilter_meter_ids"] = cfg.filter_meter_ids;
+    diag["prefilter_attempted"] = true;
+    diag["prefilter_frame_ok"] = prefilter.frame_ok;
+    diag["prefilter_meter_ok"] = prefilter.meter_ok;
+    if (prefilter.meter_ok) diag["prefilter_meter_id"] = prefilter.meter_id;
+    if (!prefilter.frame_ok) {
+      diag["prefilter_drop_stage"] = prefilter.drop_stage;
+      diag["prefilter_drop_reason"] = prefilter.drop_reason;
+      diag["prefilter_drop_detail"] = prefilter.drop_detail;
+    }
+
+    if (!prefilter.meter_ok || !meter_allowed(prefilter.meter_id)) {
+      stats.ignored++;
+      stats.input_bytes += bytes.size();
+      diag["ok"] = false;
+      diag["ignored"] = true;
+      diag["ignore_stage"] = "meter_prefilter";
+      diag["ignore_reason"] = prefilter.meter_ok ? "meter_id_not_allowed" : "meter_id_not_decodable_before_fifo_sim";
+      diag["input_bytes"] = bytes.size();
+      if (cfg.log_ignored) {
+        logf("info", "[IGN] stage=meter_prefilter reason=%s meter=%s input_len=%zu filter_meter_ids=%s",
+             prefilter.meter_ok ? "meter_id_not_allowed" : "meter_id_not_decodable_before_fifo_sim",
+             prefilter.meter_ok ? prefilter.meter_id.c_str() : "n/a", bytes.size(), cfg.filter_meter_ids.c_str());
+        publish_diag_json(diag);
+      }
+      report_stats();
+      return;
+    }
+
+    logf("info", "[FLT] meter_prefilter=pass meter=%s input_len=%zu", prefilter.meter_id.c_str(), bytes.size());
+  }
+
   std::vector<size_t> chunks;
   bool tail_dropped = false;
   std::vector<uint8_t> delivered = apply_fifo_sim(bytes, chunks, tail_dropped);
@@ -479,8 +642,9 @@ void process_payload(const std::string &topic, const std::string &payload, const
     else stats.decode_fail++;
     if (packet.is_truncated()) stats.truncated++;
     stats.invalid_symbols += packet.t1_symbols_invalid();
-    logf("warn", "[DROP] stage=%s reason=%s detail=%s truncated=%s",
-         packet.drop_stage().c_str(), packet.drop_reason().c_str(), packet.drop_detail().c_str(),
+    logf("warn", "[DROP] stage=%s reason=%s input_len=%zu delivered_len=%zu tail_dropped=%s detail=%s truncated=%s",
+         packet.drop_stage().c_str(), packet.drop_reason().c_str(), bytes.size(), delivered.size(),
+         tail_dropped ? "true" : "false", packet.drop_detail().c_str(),
          packet.is_truncated() ? "true" : "false");
     publish_diag_json(diag);
     report_stats();
@@ -502,6 +666,22 @@ void process_payload(const std::string &topic, const std::string &payload, const
     diag["meter_id_numeric"] = meter_id;
   }
   if (cfg.log_output_hex) diag["output_hex"] = out_hex;
+
+  if (!meter_allowed(meter_id_str)) {
+    stats.ignored++;
+    diag["ok"] = false;
+    diag["ignored"] = true;
+    diag["ignore_stage"] = "meter_filter";
+    diag["ignore_reason"] = "meter_id_not_allowed";
+    diag["filter_meter_ids"] = cfg.filter_meter_ids;
+    if (cfg.log_ignored) {
+      logf("info", "[IGN] stage=meter_filter reason=meter_id_not_allowed meter=%s input_len=%zu delivered_len=%zu",
+           meter_ok ? meter_id_str.c_str() : "n/a", bytes.size(), delivered.size());
+      publish_diag_json(diag);
+    }
+    report_stats();
+    return;
+  }
 
   stats.ok++;
   stats.output_bytes += frame->data().size();
@@ -587,6 +767,12 @@ int main() {
        cfg.simulate_fifo ? "true" : "false", cfg.fifo_size, cfg.fifo_threshold,
        cfg.drop_tail_below_threshold ? "true" : "false");
   logf("info", "stats_every_n=%d stats_interval_s=%d", cfg.stats_every_n, cfg.stats_interval_s);
+  logf("info", "filters: input_len_min=%d input_len_max=%d input_lengths=%s meter_ids=%s prefilter_meter_ids=%s log_ignored=%s",
+       cfg.filter_input_len_min, cfg.filter_input_len_max,
+       cfg.filter_input_lengths.empty() ? "none" : cfg.filter_input_lengths.c_str(),
+       cfg.filter_meter_ids.empty() ? "none" : cfg.filter_meter_ids.c_str(),
+       cfg.prefilter_meter_ids ? "true" : "false",
+       cfg.log_ignored ? "true" : "false");
 
   mosquitto_lib_init();
   g_mosq = mosquitto_new(cfg.client_id.c_str(), true, nullptr);
