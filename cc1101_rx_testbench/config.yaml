@@ -1,0 +1,60 @@
+name: wMBus CC1101 RX Testbench
+version: "0.1.0"
+slug: wmbus_cc1101_rx_testbench
+description: Testbench for wMBus CC1101 RX logic using MQTT raw packets from ESP/SX1262
+url: https://github.com/Kustonium/homeassistant-wmbus-cc1101-rx-testbench
+arch:
+  - amd64
+  - aarch64
+  - armv7
+  - i386
+startup: services
+boot: manual
+init: false
+hassio_api: true
+services:
+  - mqtt:need
+map:
+  - share:rw
+options:
+  mqtt_mode: auto
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  input_topic: "wmbus_bridge/raw"
+  output_topic: "wmbus_bridge/telegram_cc1101_sim"
+  diag_topic: "wmbus/diag/cc1101_sim"
+  listen_mode_hint: auto
+  simulate_fifo: true
+  fifo_size: 64
+  fifo_threshold: 32
+  drop_tail_below_threshold: false
+  publish_output: true
+  publish_diag: true
+  log_raw: false
+  log_output_hex: false
+  log_level: info
+  replay_file: ""
+  replay_interval_ms: 250
+schema:
+  mqtt_mode: list(auto|ha|external)
+  mqtt_host: str?
+  mqtt_port: port
+  mqtt_username: str?
+  mqtt_password: password?
+  input_topic: str
+  output_topic: str
+  diag_topic: str
+  listen_mode_hint: list(auto|T1|C1)
+  simulate_fifo: bool
+  fifo_size: int(1,512)
+  fifo_threshold: int(1,512)
+  drop_tail_below_threshold: bool
+  publish_output: bool
+  publish_diag: bool
+  log_raw: bool
+  log_output_hex: bool
+  log_level: list(error|warn|info|debug|trace)
+  replay_file: str?
+  replay_interval_ms: int(0,60000)
