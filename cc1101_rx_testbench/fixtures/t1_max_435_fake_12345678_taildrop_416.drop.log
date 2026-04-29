@@ -1,0 +1,2 @@
+input=416
+DROP stage=t1_length_check reason=truncated detail=decoded_len=277 need_total=290 l_field=255 trunc=1 decoded=277 want=290 got=277 symbols=554 invalid=0
